@@ -2,98 +2,111 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import math
 import numpy as np
 import scipy as sp
 import dgl
-
-class PolicyNet(nn.Module):
-    def __init__(self,
-                 n_channels,
-                 n_width):
-        super(PolicyNet, self).__init__()
-        self.linear0 = nn.Linear(n_channels, 
-                        n_width*n_width*n_channels)
-        self.deconvs = nn.ModuleList()
-        self.n_channels = n_channels
-        self.n_width = n_width
-
-        _nc = n_channels 
-        self.f_width = n_width
-        while _nc > 1:
-            self.deconvs.append(
-                nn.ConvTranspose2d(_nc, int(_nc/2), 2, stride=2, 
-                padding=0))
-            _nc = int(_nc/2)
-            self.f_width *= 2
-
-    def forward(self, h):
-        h = self.linear0(h)
-        h = F.relu(h)
-        h = h.view(1, self.n_channels, self.n_width, self.n_width)
-        for i, deconv in enumerate(self.deconvs):
-            h = deconv(h)
-            if i < (len(self.deconvs) - 1):
-                h = F.relu(h)
-                
-        h = F.softmax(h.flatten())
-        h = h.view(self.f_width, self.f_width)
-        return h
-
+from utils import *
+from model import PolicyNet
 
 def get_place(logits, mask):
-    logits = logits * mask
-    place_loc = np.unravel_index(logits.argmax(), logits.shape)
-    mask[place_loc] = 0
-    return place_loc, mask
+    _logits = torch.mul(logits, mask)
+    prob, loc = _logits.max(0)
+    mask[loc] = 0
+    return logits[loc], loc, mask
 
+def get_coord(loc, N):
+    x = (loc % N).type(torch.int)
+    y = torch.floor(loc / N).type(torch.int)
+    return x, y
 
-def cal_loss(graph, pl_assigns):
+def loc_mul_p(x, y, p):
+    return x*p, y*p
+
+def cost_func(graph, probs, placements, pl_w):
     srcs, dsts = graph.edges()
-    cost = 0
-    for (s, d) in zip(srcs.numpy(), dsts.numpy()):
-        x0, y0 = pl_assigns[s] 
-        x1, y1 = pl_assigns[d] 
-        cost += (abs(x0 - x1) + abs(y0 - y1))
+    costs = []
+    losses = []
+    for (s, d) in zip(srcs, dsts):
+        p_s = probs[s]
+        loc_s = placements[s]
+        p_d = probs[d]
+        loc_d = placements[d]
 
-    return torch.empty(4, 4).fill_(cost)
+        x_s, y_s = get_coord(loc_s, pl_w)
+        x_d, y_d = get_coord(loc_d, pl_w)
+
+        c = torch.pow(x_s - x_d, 2) + torch.pow(y_s - y_d, 2)
+        costs.append(c)
+
+        x_sp, y_sp = loc_mul_p(x_s, y_s, p_s)
+        x_dp, y_dp = loc_mul_p(x_d, y_d, p_d)
+        l = torch.pow(x_sp - x_dp, 2) + torch.pow(y_sp - y_dp, 2)
+        losses.append(l)
+
+    costs = torch.stack(costs)
+    cost = torch.sum(costs)
+
+    losses = torch.stack(losses)
+    loss = torch.sum(losses)
+        
+    return loss, cost
 
 
-def train(nepochs, nnode, feat_len, n_width, graph, feats):
-    model = PolicyNet(feat_len, n_width)
+def train(nepochs, nnode, feat_len, n_channel, n_width, graph, feats):
+    model = PolicyNet(feat_len, n_channel, n_width)
+
     pl_w = model.f_width
 
     optimizer = optim.SGD(model.parameters(), lr=0.01)
 
     for e in range(nepochs):
-        model.train()
-        mask = torch.ones(pl_w, pl_w, dtype=torch.bool)
-        pl_assigns = {}
+        with torch.autograd.set_detect_anomaly(True):
+            model.train()
+            mask = torch.ones(pl_w * pl_w) #, dtype=torch.bool)
 
-        for n in range(nnode):
-            logits = model(feats[n])
-            ploc, mask = get_place(logits, mask)
-            pl_assigns[n] = ploc
-        print(pl_assigns)
+            probs = []
+            placements = []
 
-        optimizer.zero_grad()
-        loss = cal_loss(graph, pl_assigns)
-        loss.backward()
-        optimizer.step()
+            for n in range(nnode):
+            # for n in range(1):
+                logits = model(feats, n)
+                p, loc, mask = get_place(logits, mask)
+                probs.append(p)
+                placements.append(loc)
+
+                x, y = get_coord(loc, pl_w)
+                f_node = [1, 1, x, y]
+                feats[n] = torch.tensor(f_node)
+
+            # print(probs)
+            # print(placements)
+
+            optimizer.zero_grad()
+            loss, cost = cost_func(graph, probs, placements, pl_w)
+            # print(loss.item(), cost.item())
+            print("Epoch {}: loss = {:.6f}, cost = {}".format(e, loss, cost))
+            loss.backward()
+            optimizer.step()
 
 
 if __name__ == '__main__':
-    nnode = 8
-    feat_len = 2
+    n_channel = 8
     n_width = 2
 
-    # construct a graph of an adder tree with four input adders
-    src_ids = torch.tensor([0, 1, 2, 3, 4, 5, 6])
-    dst_ids = torch.tensor([4, 4, 5, 5, 6, 6, 7])
+    path = "./programs/mac"
+    prog = "mac16"
 
-    g = dgl.graph((src_ids, dst_ids), num_nodes=nnode)
+    csr = load_scipy_csr(path, prog)
+    feat = load_feat(path, prog)
+
+    nnode, feat_len = feat.shape
+
+    # construct dgl graph 
+    g = dgl.from_scipy(csr)
+    # g = dgl.graph((src_ids, dst_ids), num_nodes=nnode)
     # g = dgl.add_reverse_edges(g)
     # g = dgl.add_self_loop(g)
 
-    feats = torch.randn(nnode, feat_len)
-
-    train(1, nnode, feat_len, n_width, g, feats)
+    train(500, nnode, feat_len, n_channel, n_width, g, feat)
+    # train(10, nnode, feat_len, n_channel, n_width, g, feat)
