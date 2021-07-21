@@ -7,7 +7,7 @@ import numpy as np
 import scipy as sp
 import dgl
 from utils import *
-from model import PolicyNet
+from model import ReticlePlaceNet
 
 def get_place(logits, mask):
     _logits = torch.mul(logits, mask)
@@ -53,8 +53,8 @@ def cost_func(graph, probs, placements, pl_w):
     return loss, cost
 
 
-def train(nepochs, nnode, feat_len, n_channel, n_width, graph, feats):
-    model = PolicyNet(feat_len, n_channel, n_width)
+def train(nepochs, nnode, feat_len, n_channel, n_width, graph, feat):
+    model = ReticlePlaceNet(feat_len, n_channel, n_width)
 
     pl_w = model.f_width
 
@@ -70,14 +70,17 @@ def train(nepochs, nnode, feat_len, n_channel, n_width, graph, feats):
 
             for n in range(nnode):
             # for n in range(1):
-                logits = model(feats, n)
+                graph.ndata['h'] = feat
+                logits = model(graph, n)
                 p, loc, mask = get_place(logits, mask)
                 probs.append(p)
                 placements.append(loc)
 
+                # update node feature
                 x, y = get_coord(loc, pl_w)
                 f_node = [1, 1, x, y]
-                feats[n] = torch.tensor(f_node)
+                # g.ndata['feat'][n] = torch.tensor(f_node)
+                feat[n] = torch.tensor(f_node)
 
             # print(probs)
             # print(placements)
@@ -87,7 +90,7 @@ def train(nepochs, nnode, feat_len, n_channel, n_width, graph, feats):
             # print(loss.item(), cost.item())
             print("Epoch {}: loss = {:.6f}, cost = {}".format(e, loss, cost))
             loss.backward()
-            optimizer.step()
+            # optimizer.step()
 
 
 if __name__ == '__main__':
@@ -95,7 +98,7 @@ if __name__ == '__main__':
     n_width = 2
 
     path = "./programs/mac"
-    prog = "mac16"
+    prog = "mac4"
 
     csr = load_scipy_csr(path, prog)
     feat = load_feat(path, prog)
@@ -104,9 +107,10 @@ if __name__ == '__main__':
 
     # construct dgl graph 
     g = dgl.from_scipy(csr)
-    # g = dgl.graph((src_ids, dst_ids), num_nodes=nnode)
-    # g = dgl.add_reverse_edges(g)
-    # g = dgl.add_self_loop(g)
+    g = dgl.add_reverse_edges(g)
+    g = dgl.add_self_loop(g)
 
-    train(500, nnode, feat_len, n_channel, n_width, g, feat)
-    # train(10, nnode, feat_len, n_channel, n_width, g, feat)
+    # g.ndata['feat'] = feat
+
+    # train(500, nnode, feat_len, n_channel, n_width, g, feat)
+    train(1, nnode, feat_len, n_channel, n_width, g, feat)
